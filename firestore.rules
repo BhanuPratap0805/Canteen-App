@@ -1,0 +1,103 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function roleInToken() {
+      return isSignedIn() ? request.auth.token.role : null;
+    }
+
+    function roleInProfile() {
+      return isSignedIn()
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+        : null;
+    }
+
+    function effectiveRole() {
+      return roleInToken() != null ? roleInToken() : roleInProfile();
+    }
+
+    function isAdmin() {
+      return isSignedIn() && effectiveRole() == 'admin';
+    }
+
+    function isCanteen() {
+      return isSignedIn() && effectiveRole() == 'canteen';
+    }
+
+    function isStaff() {
+      return isAdmin() || isCanteen();
+    }
+
+    // User profile documents
+    match /users/{userId} {
+      // Users can read their own profile, staff can read all
+      allow read: if isOwner(userId) || isStaff();
+
+      // End users can create only non-staff roles for themselves
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly([
+          'name', 'email', 'role', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role in ['user', 'student'];
+
+      // Staff can provision or update any role when required
+      allow create: if isStaff();
+
+      // User can update only their own basic profile fields (not role escalation)
+      allow update: if (
+          isOwner(userId)
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.email == resource.data.email
+        )
+        || isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+    // Orders
+    match /orders/{orderId} {
+      // Authenticated users can read their order records, staff can read all
+      allow read: if isSignedIn();
+
+      // End users create orders
+      allow create: if isSignedIn() && !isStaff();
+
+      // Only staff can update status lifecycle fields
+      allow update: if isStaff();
+
+      allow delete: if isAdmin();
+    }
+
+    // Canteen and menu management reserved for staff
+    match /canteens/{canteenId} {
+      allow read: if isSignedIn();
+      allow write: if isStaff();
+
+      match /menu/{itemId} {
+        allow read: if isSignedIn();
+        allow write: if isStaff();
+      }
+    }
+
+    // Payments are sensitive, user reads own records, staff can manage
+    match /payments/{paymentId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if isStaff();
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

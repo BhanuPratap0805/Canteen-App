@@ -1,8 +1,5 @@
 {
   "expo": {
-    "updates": {
-      "enabled": false
-    },
     "extra": {
       "eas": {
         "projectId": "da69a792-4c9a-4c37-87a7-7d0ae9414641"

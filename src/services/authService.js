@@ -1,98 +1,288 @@
-import { auth, db } from '../config/firebase';
 import {
   createUserWithEmailAndPassword,
+  getIdTokenResult,
+  sendEmailVerification,
   signInWithEmailAndPassword,
   signOut,
-  onAuthStateChanged,
+  updateProfile,
 } from 'firebase/auth';
-import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore';
+import { auth, isFirebaseConfigured } from '../config/firebase';
+import { ROLES } from '../config/constants';
+import { createUserProfile, getUserProfile, upsertUserProfile, updateUserProfile } from './userService';
 
-export function getErrorMessage(code) {
-  switch (code) {
-    case 'auth/invalid-email':
-      return 'Please enter a valid email address.';
-    case 'auth/user-not-found':
-      return 'No account found with this email.';
-    case 'auth/wrong-password':
-    case 'auth/invalid-credential':
-      return 'Incorrect email or password.';
-    case 'auth/email-already-in-use':
-      return 'An account already exists with this email.';
-    case 'auth/weak-password':
-      return 'Password is too weak. Use at least 6 characters.';
-    case 'auth/network-request-failed':
-      return 'Network error. Please check your connection and try again.';
-    case 'auth/too-many-requests':
-      return 'Too many attempts. Please try again later.';
-    default:
-      return 'Something went wrong. Please try again.';
-  }
-}
+const ADMIN_EMAIL = process.env.EXPO_PUBLIC_ADMIN_EMAIL || 'admin@canteen.com';
+const NORMALIZED_ADMIN_EMAIL = ADMIN_EMAIL.trim().toLowerCase();
+const STAFF_ROLES = [ROLES.ADMIN, ROLES.CANTEEN];
 
-export async function getUserProfile(uid) {
-  const ref = doc(db, 'users', uid);
-  const snap = await getDoc(ref);
-  if (!snap.exists()) return null;
-  return { uid, ...snap.data() };
-}
-
-export async function registerStudent(name, rollNumber, email, phone, password) {
-  const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
-  const user = cred.user;
-
-  const userRef = doc(db, 'users', user.uid);
-  await setDoc(userRef, {
-    name: String(name || '').trim(),
-    rollNumber: String(rollNumber || '').trim().toUpperCase(),
-    email: String(email || '').trim().toLowerCase(),
-    phone: String(phone || '').trim(),
-    role: 'student',
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  return user;
-}
-
-async function loginWithRole(email, password, requiredRole) {
-  const cred = await signInWithEmailAndPassword(auth, email.trim(), password);
-  const user = cred.user;
-
-  const profile = await getUserProfile(user.uid);
-  if (!profile) {
-    await signOut(auth);
-    const err = new Error('Profile not found. Please contact support.');
-    err.code = 'profile/not-found';
-    throw err;
-  }
-
-  if (profile.role !== requiredRole) {
-    await signOut(auth);
-    const err = new Error(
-      requiredRole === 'student'
-        ? 'This account is not a student account.'
-        : 'This account is not a staff account.'
+const ensureFirebaseConfigured = () => {
+  if (!isFirebaseConfigured) {
+    throw new Error(
+      'Firebase config missing. Add EXPO_PUBLIC_FIREBASE_* values in your environment.'
     );
-    err.code = 'auth/role-mismatch';
-    throw err;
+  }
+};
+
+const createAuthError = (code, message) => {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+};
+
+const normalizeRole = (value) => {
+  const role = String(value || '').trim().toLowerCase();
+  if (!role) return null;
+
+  if ([ROLES.ADMIN, ROLES.CANTEEN, ROLES.STUDENT, ROLES.USER].includes(role)) {
+    return role;
   }
 
-  return { user, profile };
-}
+  return null;
+};
 
-export function loginStudent(email, password) {
-  return loginWithRole(email, password, 'student');
-}
+const isStaffRole = (role) => STAFF_ROLES.includes(role);
 
-export function loginStaff(email, password) {
-  return loginWithRole(email, password, 'staff');
-}
+const resolveUserRole = async (firebaseUser) => {
+  const email = (firebaseUser?.email || '').trim().toLowerCase();
 
-export function logout() {
-  return signOut(auth);
-}
+  let roleFromClaims = null;
+  let roleFromProfile = null;
 
-export function onAuthChange(callback) {
-  return onAuthStateChanged(auth, callback);
-}
+  try {
+    const tokenResult = await getIdTokenResult(firebaseUser);
+    roleFromClaims = normalizeRole(tokenResult?.claims?.role);
+  } catch (error) {
+    console.warn('Unable to read auth token claims:', error?.message || error);
+  }
 
+  try {
+    const profile = await getUserProfile(firebaseUser.uid);
+    roleFromProfile = normalizeRole(profile?.role);
+  } catch (error) {
+    console.warn('Unable to read user profile role:', error?.message || error);
+  }
+
+  const fallbackRole = email === NORMALIZED_ADMIN_EMAIL ? ROLES.ADMIN : ROLES.USER;
+  const resolvedRole = roleFromClaims || roleFromProfile || fallbackRole;
+
+  try {
+    await upsertUserProfile(firebaseUser.uid, {
+      email: firebaseUser.email || undefined,
+      name:
+        firebaseUser.displayName || (resolvedRole === ROLES.ADMIN ? 'Admin' : 'Customer'),
+      role: resolvedRole,
+    });
+  } catch (error) {
+    console.warn('Unable to upsert user profile during role resolution:', error?.message || error);
+  }
+
+  return resolvedRole;
+};
+
+const mapFirebaseUser = (firebaseUser, role) => {
+  if (!firebaseUser) return null;
+
+  return {
+    uid: firebaseUser.uid,
+    role: role || ROLES.USER,
+    email: firebaseUser.email || undefined,
+    name: firebaseUser.displayName || (role === ROLES.ADMIN ? 'Admin' : 'Customer'),
+  };
+};
+
+const buildSessionFromFirebaseUser = async (firebaseUser) => {
+  const resolvedRole = await resolveUserRole(firebaseUser);
+  return mapFirebaseUser(firebaseUser, resolvedRole);
+};
+
+export const loginUser = async ({ email, password }) => {
+  ensureFirebaseConfigured();
+
+  const normalizedEmail = (email || '').trim().toLowerCase();
+
+  const result = await signInWithEmailAndPassword(auth, normalizedEmail, password);
+  const sessionUser = await buildSessionFromFirebaseUser(result.user);
+
+  if (isStaffRole(sessionUser.role)) {
+    await signOut(auth);
+    throw new Error('This account is admin. Please login from Admin section.');
+  }
+
+  if (!result.user.emailVerified) {
+    await signOut(auth);
+    throw createAuthError(
+      'auth/unverified-email',
+      'Please verify your email address before logging in. Check your inbox for the verification link.'
+    );
+  }
+
+  const token = await result.user.getIdToken();
+
+  return {
+    token,
+    user: sessionUser,
+  };
+};
+
+export const signupUser = async ({ name, email, password }) => {
+  ensureFirebaseConfigured();
+
+  const normalizedEmail = (email || '').trim().toLowerCase();
+  const trimmedName = (name || '').trim();
+
+  if (normalizedEmail === NORMALIZED_ADMIN_EMAIL) {
+    throw new Error('This email is reserved for admin. Please use a different email.');
+  }
+
+  let result;
+
+  try {
+    result = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
+  } catch (error) {
+    const code = error?.code || '';
+
+    if (code.includes('email-already-in-use')) {
+      try {
+        const existingResult = await signInWithEmailAndPassword(auth, normalizedEmail, password);
+
+        if (!existingResult.user.emailVerified) {
+          try {
+            await sendEmailVerification(existingResult.user);
+          } catch (verificationError) {
+            console.warn(
+              'Failed to resend verification email for existing unverified account:',
+              verificationError?.message || verificationError
+            );
+          }
+
+          await signOut(auth);
+
+          return {
+            requiresEmailVerification: true,
+            verificationAction: 'resent',
+            email: normalizedEmail,
+            user: await buildSessionFromFirebaseUser(existingResult.user),
+          };
+        }
+
+        await signOut(auth);
+        throw createAuthError(
+          'auth/email-already-verified',
+          'This email is already verified. Please login instead of signing up.'
+        );
+      } catch (signInError) {
+        const signInCode = signInError?.code || '';
+
+        if (signInCode.includes('invalid-credential') || signInCode.includes('wrong-password')) {
+          throw createAuthError(
+            'auth/unverified-account-password-required',
+            'This email already has an account. To resend verification link, enter the same password used during signup.'
+          );
+        }
+
+        throw error;
+      }
+    }
+
+    throw error;
+  }
+
+  if (trimmedName) {
+    await updateProfile(result.user, { displayName: trimmedName });
+    await result.user.reload();
+  }
+
+  try {
+    await createUserProfile(result.user.uid, {
+      name: trimmedName,
+      email: normalizedEmail,
+      role: ROLES.USER,
+    });
+  } catch (dbError) {
+    console.warn('Failed to create user profile in Firestore:', dbError);
+  }
+
+  try {
+    await sendEmailVerification(result.user);
+  } catch (verificationError) {
+    console.warn('Failed to send verification email:', verificationError?.message || verificationError);
+  }
+
+  await signOut(auth);
+
+  return {
+    requiresEmailVerification: true,
+    verificationAction: 'sent',
+    email: normalizedEmail,
+    user: await buildSessionFromFirebaseUser(result.user),
+  };
+};
+
+export const loginAdmin = async ({ email, password }) => {
+  ensureFirebaseConfigured();
+
+  const normalizedEmail = (email || '').trim().toLowerCase();
+
+  const result = await signInWithEmailAndPassword(auth, normalizedEmail, password);
+  const sessionUser = await buildSessionFromFirebaseUser(result.user);
+
+  if (!isStaffRole(sessionUser.role)) {
+    await signOut(auth);
+    throw new Error('Not authorized as admin account');
+  }
+
+  const token = await result.user.getIdToken();
+
+  return {
+    token,
+    user: sessionUser,
+  };
+};
+
+export const getCurrentAuthenticatedSession = async () => {
+  ensureFirebaseConfigured();
+
+  const currentUser = auth.currentUser;
+  if (!currentUser) return null;
+
+  const sessionUser = await buildSessionFromFirebaseUser(currentUser);
+
+  if (
+    !isStaffRole(sessionUser.role) &&
+    !currentUser.emailVerified
+  ) {
+    await signOut(auth);
+    return null;
+  }
+
+  const token = await currentUser.getIdToken();
+
+  return {
+    token,
+    user: sessionUser,
+  };
+};
+
+export const logoutFromAuth = async () => {
+  ensureFirebaseConfigured();
+  await signOut(auth);
+};
+
+export const updateAuthUserProfile = async ({ name }) => {
+  ensureFirebaseConfigured();
+
+  if (!auth.currentUser || !name) return;
+
+  await updateProfile(auth.currentUser, { displayName: name });
+
+  try {
+    await updateUserProfile(auth.currentUser.uid, { name });
+  } catch (error) {
+    console.warn('Failed to sync profile name to Firestore:', error?.message || error);
+  }
+};
+
+export const getAdminLoginInfo = () => ({
+  email: ADMIN_EMAIL,
+  passwordHint:
+    'Use password set for this email in Firebase Authentication (Email/Password provider).',
+});

@@ -1,30 +1,47 @@
 import { Platform } from 'react-native';
-import { initializeApp, getApps, getApp } from 'firebase/app';
+import { initializeApp, getApp, getApps } from 'firebase/app';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getAuth, initializeAuth, getReactNativePersistence } from 'firebase/auth';
+import { getAuth, getReactNativePersistence, initializeAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
 
 const firebaseConfig = {
-  apiKey: 'AIzaSyAFhzguJyby8SU8NoQFCk9bUcQuPmaPFOE',
-  authDomain: 'campus-canteen-d5a01.firebaseapp.com',
-  projectId: 'campus-canteen-d5a01',
-  storageBucket: 'campus-canteen-d5a01.firebasestorage.app',
-  messagingSenderId: '1069449434408',
-  appId: '1:1069449434408:web:5db6443fbd1133a5b66c1d',
+  apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.EXPO_PUBLIC_FIREBASE_APP_ID,
 };
 
-const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+export const isFirebaseConfigured =
+  Boolean(firebaseConfig.apiKey) &&
+  Boolean(firebaseConfig.authDomain) &&
+  Boolean(firebaseConfig.projectId) &&
+  Boolean(firebaseConfig.appId);
 
-let auth;
+export const firebaseApp = isFirebaseConfigured
+  ? getApps().length
+    ? getApp()
+    : initializeApp(firebaseConfig)
+  : null;
 
-if (Platform.OS === 'web') {
-  auth = getAuth(app);
-} else {
-  auth = initializeAuth(app, {
-    persistence: getReactNativePersistence(AsyncStorage),
-  });
+let authInstance = null;
+
+if (firebaseApp) {
+  if (Platform.OS === 'web') {
+    authInstance = getAuth(firebaseApp);
+  } else {
+    try {
+      authInstance = initializeAuth(firebaseApp, {
+        persistence: getReactNativePersistence(AsyncStorage),
+      });
+    } catch (error) {
+      authInstance = getAuth(firebaseApp);
+    }
+  }
 }
 
-export { auth };
-export const db = getFirestore(app);
-export default app;
+export const auth = authInstance;
+export const db = firebaseApp ? getFirestore(firebaseApp) : null;
+
+export default firebaseApp;
